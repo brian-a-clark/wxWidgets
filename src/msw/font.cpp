@@ -159,7 +159,8 @@ public:
 
     int GetLogFontHeightAtPPI(int ppi) const
     {
-        return m_nativeFontInfo.GetLogFontHeightAtPPI(ppi);
+        return m_nativeFontInfo.GetLogFontHeightAtPPI(
+            m_nativeFontInfo.pointSize, ppi);
     }
 
     // ... and setters: notice that all of them invalidate the currently
@@ -403,12 +404,18 @@ void wxFontRefData::Free()
 // ----------------------------------------------------------------------------
 
 /* static */
-float wxNativeFontInfo::GetPointSizeFromLogFontHeight(int height)
+float wxNativeFontInfo::GetPointSizeAtPPI(int lfHeight, int ppi)
 {
-    // Determine the size in points using the primary screen DPI as we don't
-    // have anything else here.
-    const float ppi = ::GetDeviceCaps(ScreenHDC(), LOGPIXELSY);
-    return 72.0f * abs(height) / ppi;
+    if ( ppi == 0 )
+        ppi = ::GetDeviceCaps(ScreenHDC(), LOGPIXELSY);
+
+    return abs(lfHeight) * 72.0f / ppi;
+}
+
+/* static */
+int wxNativeFontInfo::GetLogFontHeightAtPPI(float size, int ppi)
+{
+    return -wxRound(size * ppi / 72.0f);
 }
 
 void wxNativeFontInfo::Init()
@@ -512,7 +519,8 @@ wxFontEncoding wxNativeFontInfo::GetEncoding() const
 void wxNativeFontInfo::SetFractionalPointSize(float pointSizeNew)
 {
     // We don't have the correct DPI to use here, so use that of the
-    // primary screen.
+    // primary screen and rely on WXAdjustToPPI() changing it later if
+    // necessary.
     const int ppi = ::GetDeviceCaps(ScreenHDC(), LOGPIXELSY);
     lf.lfHeight = GetLogFontHeightAtPPI(pointSizeNew, ppi);
 
@@ -535,7 +543,7 @@ void wxNativeFontInfo::SetPixelSize(const wxSize& pixelSize)
 
     // We don't have the right DPI to use here neither, but we need to update
     // the point size too, so fall back to the default.
-    pointSize = GetPointSizeFromLogFontHeight(lf.lfHeight);
+    pointSize = GetPointSizeAtPPI(lf.lfHeight);
 }
 
 void wxNativeFontInfo::SetStyle(wxFontStyle style)
@@ -658,13 +666,15 @@ bool wxNativeFontInfo::FromString(const wxString& s)
     if ( !token.ToLong(&l) )
         return false;
 
-    bool setPointSizeFromHeight = false;
+    // If fractional point size is not present (which can happen if we have a
+    // string in version 0 or even with version 1 if it doesn't contain a valid
+    // point size), ensure that we set it from lfHeight below.
+    bool setPointSizeFromHeight = true;
     switch ( l )
     {
         case 0:
-            // Fractional point size is not present in this version, it will be
-            // set from lfHeight below in this case.
-            setPointSizeFromHeight = true;
+            // Fractional point size is not present in this version, so nothing
+            // special to do.
             break;
 
         case 1:
@@ -672,9 +682,17 @@ bool wxNativeFontInfo::FromString(const wxString& s)
                 double d;
                 if ( !tokenizer.GetNextToken().ToCDouble(&d) )
                     return false;
-                pointSize = static_cast<float>(d);
-                if ( static_cast<double>(pointSize) != d )
-                    return false;
+
+                // If the size is present but 0, ignore it and still use
+                // lfHeight, as with v0 strings.
+                if ( !wxIsNullDouble(d) )
+                {
+                    pointSize = static_cast<float>(d);
+                    if ( static_cast<double>(pointSize) != d )
+                        return false;
+
+                    setPointSizeFromHeight = false;
+                }
             }
             break;
 
@@ -688,7 +706,7 @@ bool wxNativeFontInfo::FromString(const wxString& s)
         return false;
     lf.lfHeight = l;
     if ( setPointSizeFromHeight )
-        pointSize = GetPointSizeFromLogFontHeight(l);
+        pointSize = GetPointSizeAtPPI(l);
 
     token = tokenizer.GetNextToken();
     if ( !token.ToLong(&l) )
@@ -887,6 +905,19 @@ void wxFont::SetPixelSize(const wxSize& pixelSize)
     AllocExclusive();
 
     M_FONTDATA->SetPixelSize(pixelSize);
+}
+
+void wxFont::WXAdjustToPPI(const wxSize& ppi)
+{
+    // We only use vertical component here as we only adjust LOGFONT::lfHeight.
+    const int heightNew = M_FONTDATA->GetLogFontHeightAtPPI(ppi.y);
+
+    if ( heightNew != M_FONTDATA->GetLogFontHeight() )
+    {
+        AllocExclusive();
+
+        M_FONTDATA->SetLogFontHeight(heightNew);
+    }
 }
 
 void wxFont::SetFamily(wxFontFamily family)

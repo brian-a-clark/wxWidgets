@@ -58,7 +58,6 @@
     #include "wx/ownerdrw.h"
 #endif
 
-#include "wx/display.h"
 #include "wx/evtloop.h"
 #include "wx/hashmap.h"
 #include "wx/popupwin.h"
@@ -2421,8 +2420,9 @@ wxWindowMSW::HandleMenuSelect(WXWORD nItem, WXWORD flags, WXHMENU hMenu)
     if ( flags & (MF_POPUP | MF_SEPARATOR) )
         item = wxID_NONE;
 
-    wxMenuEvent event(wxEVT_MENU_HIGHLIGHT, item);
-    if ( wxMenu::ProcessMenuEvent(MSWFindMenuFromHMENU(hMenu), event, this) )
+    wxMenu* menu = MSWFindMenuFromHMENU(hMenu);
+    wxMenuEvent event(wxEVT_MENU_HIGHLIGHT, item, menu);
+    if ( wxMenu::ProcessMenuEvent(menu, event, this) )
         return true;
 
     // by default, i.e. if the event wasn't handled above, clear the status bar
@@ -4720,23 +4720,28 @@ wxWindowMSW::MSWOnMeasureItem(int id, WXMEASUREITEMSTRUCT *itemStruct)
 namespace
 {
 
-static inline const wxTopLevelWindow* wxGetWinTLW(const wxWindow* win)
+static wxSize GetWindowDPI(HWND hwnd)
 {
-    if ( win )
+#if wxUSE_DYNLIB_CLASS
+    typedef UINT (WINAPI *GetDpiForWindow_t)(HWND hwnd);
+    static GetDpiForWindow_t s_pfnGetDpiForWindow = NULL;
+    static bool s_initDone = false;
+
+    if ( !s_initDone )
     {
-        const wxWindow* tlwWin = wxGetTopLevelParent(const_cast<wxWindow*>(win));
-        return wxDynamicCast(tlwWin, wxTopLevelWindow);
-    }
-    else if ( wxTheApp )
-    {
-        wxWindow* window = wxTheApp->GetTopWindow();
-        if ( window )
-        {
-            return wxDynamicCast(wxGetTopLevelParent(window), wxTopLevelWindow);
-        }
+        wxLoadedDLL dllUser32("user32.dll");
+        wxDL_INIT_FUNC(s_pfn, GetDpiForWindow, dllUser32);
+        s_initDone = true;
     }
 
-    return NULL;
+    if ( s_pfnGetDpiForWindow )
+    {
+        const int dpi = static_cast<int>(s_pfnGetDpiForWindow(hwnd));
+        return wxSize(dpi, dpi);
+    }
+#endif // wxUSE_DYNLIB_CLASS
+
+    return wxSize();
 }
 
 }
@@ -4745,9 +4750,9 @@ static inline const wxTopLevelWindow* wxGetWinTLW(const wxWindow* win)
 int wxGetSystemMetrics(int nIndex, const wxWindow* win)
 {
 #if wxUSE_DYNLIB_CLASS
-    const wxTopLevelWindow* tlw = wxGetWinTLW(win);
+    const wxWindow* window = (!win && wxTheApp) ? wxTheApp->GetTopWindow() : win;
 
-    if ( tlw )
+    if ( window )
     {
         typedef int (WINAPI * GetSystemMetricsForDpi_t)(int nIndex, UINT dpi);
         static GetSystemMetricsForDpi_t s_pfnGetSystemMetricsForDpi = NULL;
@@ -4762,8 +4767,7 @@ int wxGetSystemMetrics(int nIndex, const wxWindow* win)
 
         if ( s_pfnGetSystemMetricsForDpi )
         {
-            WindowHDC hdc(tlw->GetHWND());
-            const int dpi = ::GetDeviceCaps(hdc, LOGPIXELSY);
+            const int dpi = window->GetDPI().y;
             return s_pfnGetSystemMetricsForDpi(nIndex, (UINT)dpi);
         }
     }
@@ -4778,9 +4782,9 @@ int wxGetSystemMetrics(int nIndex, const wxWindow* win)
 bool wxSystemParametersInfo(UINT uiAction, UINT uiParam, PVOID pvParam, UINT fWinIni, const wxWindow* win)
 {
 #if wxUSE_DYNLIB_CLASS
-    const wxTopLevelWindow* tlw = wxGetWinTLW(win);
+    const wxWindow* window = (!win && wxTheApp) ? wxTheApp->GetTopWindow() : win;
 
-    if ( tlw )
+    if ( window )
     {
         typedef int (WINAPI * SystemParametersInfoForDpi_t)(UINT uiAction, UINT uiParam, PVOID pvParam, UINT fWinIni, UINT dpi);
         static SystemParametersInfoForDpi_t s_pfnSystemParametersInfoForDpi = NULL;
@@ -4795,8 +4799,7 @@ bool wxSystemParametersInfo(UINT uiAction, UINT uiParam, PVOID pvParam, UINT fWi
 
         if ( s_pfnSystemParametersInfoForDpi )
         {
-            WindowHDC hdc(tlw->GetHWND());
-            const int dpi = ::GetDeviceCaps(hdc, LOGPIXELSY);
+            const int dpi = window->GetDPI().y;
             if ( s_pfnSystemParametersInfoForDpi(uiAction, uiParam, pvParam, fWinIni, (UINT)dpi) == TRUE )
             {
                 return true;
@@ -4808,6 +4811,90 @@ bool wxSystemParametersInfo(UINT uiAction, UINT uiParam, PVOID pvParam, UINT fWi
 #endif // wxUSE_DYNLIB_CLASS
 
     return ::SystemParametersInfo(uiAction, uiParam, pvParam, fWinIni) == TRUE;
+}
+
+wxSize wxWindowMSW::GetDPI() const
+{
+    HWND hwnd = GetHwnd();
+
+    if ( hwnd == NULL )
+    {
+        const wxWindow* topWin = wxGetTopLevelParent(const_cast<wxWindow*>(this));
+        if ( topWin )
+        {
+            hwnd = GetHwndOf(topWin);
+        }
+    }
+
+    wxSize dpi = GetWindowDPI(hwnd);
+
+    if ( !dpi.x || !dpi.y )
+    {
+        WindowHDC hdc(GetHwnd());
+        dpi.x = ::GetDeviceCaps(hdc, LOGPIXELSX);
+        dpi.y = ::GetDeviceCaps(hdc, LOGPIXELSY);
+    }
+
+    return dpi;
+}
+
+void wxWindowMSW::MSWUpdateFontOnDPIChange(const wxSize& newDPI)
+{
+    if ( m_font.IsOk() )
+    {
+        m_font.WXAdjustToPPI(newDPI);
+
+        // WXAdjustToPPI() changes the HFONT, so reassociate it with the window.
+        wxSetWindowFont(GetHwnd(), m_font);
+    }
+}
+
+// Helper function to update the given coordinate by the scaling factor if it
+// is set, i.e. different from wxDefaultCoord.
+static void ScaleCoordIfSet(int& coord, float scaleFactor)
+{
+    if ( coord != wxDefaultCoord )
+    {
+        const float coordScaled = coord * scaleFactor;
+        coord = scaleFactor > 1.0 ? ceil(coordScaled) : floor(coordScaled);
+    }
+}
+
+void
+wxWindowMSW::MSWUpdateOnDPIChange(const wxSize& oldDPI, const wxSize& newDPI)
+{
+    // update min and max size if necessary
+    const float scaleFactor = (float)newDPI.y / oldDPI.y;
+
+    ScaleCoordIfSet(m_minHeight, scaleFactor);
+    ScaleCoordIfSet(m_minWidth, scaleFactor);
+    ScaleCoordIfSet(m_maxHeight, scaleFactor);
+    ScaleCoordIfSet(m_maxWidth, scaleFactor);
+
+    InvalidateBestSize();
+
+    // update font if necessary
+    MSWUpdateFontOnDPIChange(newDPI);
+
+    // update children
+    wxWindowList::compatibility_iterator current = GetChildren().GetFirst();
+    while ( current )
+    {
+        wxWindow *childWin = current->GetData();
+        // Update all children, except other top-level windows.
+        // These could be on a different monitor and will get their own
+        // dpi-changed event.
+        if ( childWin && !childWin->IsTopLevel() )
+        {
+            childWin->MSWUpdateOnDPIChange(oldDPI, newDPI);
+        }
+
+        current = current->GetNext();
+    }
+
+    wxDPIChangedEvent event(oldDPI, newDPI);
+    event.SetEventObject(this);
+    HandleWindowEvent(event);
 }
 
 // ---------------------------------------------------------------------------
